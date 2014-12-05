@@ -1,4 +1,4 @@
-# librtlsdr Raspian packages
+# librtlsdr Raspbian packages
 
 This branch provides Raspbian-flavoured Debian packages for librtlsdr.
 They are based on the packaging done for the Debian wheezy-backports package.
