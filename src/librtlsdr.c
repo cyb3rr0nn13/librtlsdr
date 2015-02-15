@@ -1,3 +1,4 @@
+/* -*- mode: C; indent-tabs-mode: t; c-basic-offset: 8 -*- */
 /*
  * rtl-sdr, turns your Realtek RTL2832 based DVB dongle into a SDR receiver
  * Copyright (C) 2012-2014 by Steve Markgraf <steve@steve-m.de>
@@ -68,6 +69,7 @@ typedef struct rtlsdr_tuner_iface {
 
 enum rtlsdr_async_status {
 	RTLSDR_INACTIVE = 0,
+	RTLSDR_CANCEL_REQUEST,
 	RTLSDR_CANCELING,
 	RTLSDR_RUNNING
 };
@@ -92,17 +94,32 @@ static const int fir_default[FIR_LEN] = {
 	101, 156, 215, 273, 327, 372, 404, 421	/* 12 bit signed */
 };
 
+/* Context for one bulk transfer; passed as libusb user data */
+struct xfer_ctx {
+	struct rtlsdr_dev *dev;            /* the owning device */
+	struct libusb_transfer *usb_xfer;  /* the bulk transfer */
+	unsigned char *buf;                /* the associated data buffer */
+	enum {
+		XFER_IDLE,           /* newly created */
+		XFER_SUBMITTED,      /* transfer submitted, awaiting completion */
+		XFER_CANCELING,      /* transfer cancelled, awaiting completion */
+		XFER_COMPLETED_OK,   /* transfer completed OK */
+		XFER_COMPLETED_ERROR /* transfer completed with an error */
+	} status;
+	unsigned int actual_length;  /* if XFER_COMPLETED_OK, valid data length  */
+	struct xfer_ctx *next;       /* if XFER_COMPLETED_*, next unhandled completed transfer in the list */
+};
+
 struct rtlsdr_dev {
 	libusb_context *ctx;
 	struct libusb_device_handle *devh;
 	uint32_t xfer_buf_num;
 	uint32_t xfer_buf_len;
-	struct libusb_transfer **xfer;
-	unsigned char **xfer_buf;
-	rtlsdr_read_async_cb_t cb;
-	void *cb_ctx;
+	struct xfer_ctx *xfer;       /* array of xfer_buf_num transfer contexts */
+	struct xfer_ctx *xfer_head;  /* first unhandled completed transfer */
+	struct xfer_ctx *xfer_tail;  /* last unhandled completed transfer */
 	enum rtlsdr_async_status async_status;
-	int async_cancel;
+	int async_wakeup;
 	/* rtl demod context */
 	uint32_t rate; /* Hz */
 	uint32_t rtl_xtal; /* Hz */
@@ -1590,6 +1607,7 @@ int rtlsdr_close(rtlsdr_dev_t *dev)
 
 	if(!dev->dev_lost) {
 		/* block until all async operations have been completed (if any) */
+		rtlsdr_cancel_async(dev);
 		while (RTLSDR_INACTIVE != dev->async_status) {
 #ifdef _WIN32
 			Sleep(1);
@@ -1640,28 +1658,45 @@ int rtlsdr_read_sync(rtlsdr_dev_t *dev, void *buf, int len, int *n_read)
 	return libusb_bulk_transfer(dev->devh, 0x81, buf, len, n_read, BULK_TIMEOUT);
 }
 
-static void LIBUSB_CALL _libusb_callback(struct libusb_transfer *xfer)
+static void LIBUSB_CALL _libusb_callback(struct libusb_transfer *usb_xfer)
 {
-	rtlsdr_dev_t *dev = (rtlsdr_dev_t *)xfer->user_data;
+	struct xfer_ctx *ctx = (struct xfer_ctx *)usb_xfer->user_data;
+	rtlsdr_dev_t *dev = ctx->dev;
 
-	if (LIBUSB_TRANSFER_COMPLETED == xfer->status) {
-		if (dev->cb)
-			dev->cb(xfer->buffer, xfer->actual_length, dev->cb_ctx);
+	/* add this transfer to the list of unprocessed completed transfers;
+	 * the actual callback to user code is done from rtlsdr_read_async()
+	 */
+	ctx->next = NULL;
+	if (!dev->xfer_head)
+		dev->xfer_head = ctx;
+	else
+		dev->xfer_tail->next = ctx;
+	dev->xfer_tail = ctx;
+	dev->async_wakeup = 1;
 
-		libusb_submit_transfer(xfer); /* resubmit transfer */
+	if (LIBUSB_TRANSFER_COMPLETED == usb_xfer->status) {
+		ctx->status = XFER_COMPLETED_OK;
+		ctx->actual_length = usb_xfer->actual_length;
 		dev->xfer_errors = 0;
-	} else if (LIBUSB_TRANSFER_CANCELLED != xfer->status) {
+	} else if (LIBUSB_TRANSFER_CANCELLED == usb_xfer->status && ctx->status == XFER_CANCELING) {
+		/* we expect this */
+		ctx->status = XFER_COMPLETED_ERROR;
+	} else {
+		/* unexpected error */
+		ctx->status = XFER_COMPLETED_ERROR;
 #ifndef _WIN32
-		if (LIBUSB_TRANSFER_ERROR == xfer->status)
+		if (LIBUSB_TRANSFER_ERROR == usb_xfer->status)
 			dev->xfer_errors++;
 
 		if (dev->xfer_errors >= dev->xfer_buf_num ||
-		    LIBUSB_TRANSFER_NO_DEVICE == xfer->status) {
+		    LIBUSB_TRANSFER_NO_DEVICE == usb_xfer->status) {
 #endif
-			dev->dev_lost = 1;
-			rtlsdr_cancel_async(dev);
-			fprintf(stderr, "cb transfer status: %d, "
-				"canceling...\n", xfer->status);
+			if (!dev->dev_lost) {
+				dev->dev_lost = 1;
+				fprintf(stderr, "cb transfer status: %d, "
+					"canceling...\n", usb_xfer->status);
+				rtlsdr_cancel_async(dev);
+			}
 #ifndef _WIN32
 		}
 #endif
@@ -1673,6 +1708,8 @@ int rtlsdr_wait_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx)
 	return rtlsdr_read_async(dev, cb, ctx, 0, 0);
 }
 
+static int _rtlsdr_free_async_buffers(rtlsdr_dev_t *dev);
+
 static int _rtlsdr_alloc_async_buffers(rtlsdr_dev_t *dev)
 {
 	unsigned int i;
@@ -1680,20 +1717,28 @@ static int _rtlsdr_alloc_async_buffers(rtlsdr_dev_t *dev)
 	if (!dev)
 		return -1;
 
-	if (!dev->xfer) {
-		dev->xfer = malloc(dev->xfer_buf_num *
-				   sizeof(struct libusb_transfer *));
+	if (dev->xfer)
+		return -1;
 
-		for(i = 0; i < dev->xfer_buf_num; ++i)
-			dev->xfer[i] = libusb_alloc_transfer(0);
+	dev->xfer = (struct xfer_ctx *)malloc(dev->xfer_buf_num * sizeof(struct xfer_ctx));
+	if (!dev->xfer)
+		return -1;
+
+	for (i = 0; i < dev->xfer_buf_num; ++i) {
+		dev->xfer[i].dev = dev;
+		dev->xfer[i].usb_xfer = NULL;
+		dev->xfer[i].buf = NULL;
+		dev->xfer[i].status = XFER_IDLE;
+		dev->xfer[i].next = NULL;
 	}
 
-	if (!dev->xfer_buf) {
-		dev->xfer_buf = malloc(dev->xfer_buf_num *
-					   sizeof(unsigned char *));
-
-		for(i = 0; i < dev->xfer_buf_num; ++i)
-			dev->xfer_buf[i] = malloc(dev->xfer_buf_len);
+	for (i = 0; i < dev->xfer_buf_num; ++i) {
+		dev->xfer[i].usb_xfer = libusb_alloc_transfer(0);
+		dev->xfer[i].buf = (unsigned char*)malloc(dev->xfer_buf_len);
+		if (!dev->xfer[i].usb_xfer || !dev->xfer[i].buf) {
+			_rtlsdr_free_async_buffers(dev);
+			return -1;
+		}
 	}
 
 	return 0;
@@ -1708,23 +1753,14 @@ static int _rtlsdr_free_async_buffers(rtlsdr_dev_t *dev)
 
 	if (dev->xfer) {
 		for(i = 0; i < dev->xfer_buf_num; ++i) {
-			if (dev->xfer[i]) {
-				libusb_free_transfer(dev->xfer[i]);
+			if (dev->xfer[i].usb_xfer) {
+				libusb_free_transfer(dev->xfer[i].usb_xfer);
 			}
+			free(dev->xfer[i].buf);
 		}
 
 		free(dev->xfer);
 		dev->xfer = NULL;
-	}
-
-	if (dev->xfer_buf) {
-		for(i = 0; i < dev->xfer_buf_num; ++i) {
-			if (dev->xfer_buf[i])
-				free(dev->xfer_buf[i]);
-		}
-
-		free(dev->xfer_buf);
-		dev->xfer_buf = NULL;
 	}
 
 	return 0;
@@ -1737,19 +1773,12 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 	int r = 0;
 	struct timeval tv = { 1, 0 };
 	struct timeval zerotv = { 0, 0 };
-	enum rtlsdr_async_status next_status = RTLSDR_INACTIVE;
 
 	if (!dev)
 		return -1;
 
 	if (RTLSDR_INACTIVE != dev->async_status)
 		return -2;
-
-	dev->async_status = RTLSDR_RUNNING;
-	dev->async_cancel = 0;
-
-	dev->cb = cb;
-	dev->cb_ctx = ctx;
 
 	if (buf_num > 0)
 		dev->xfer_buf_num = buf_num;
@@ -1761,75 +1790,105 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 	else
 		dev->xfer_buf_len = DEFAULT_BUF_LENGTH;
 
-	_rtlsdr_alloc_async_buffers(dev);
+	if (_rtlsdr_alloc_async_buffers(dev) < 0)
+		return -1;
+
+	dev->async_status = RTLSDR_RUNNING;
 
 	for(i = 0; i < dev->xfer_buf_num; ++i) {
-		libusb_fill_bulk_transfer(dev->xfer[i],
+		libusb_fill_bulk_transfer(dev->xfer[i].usb_xfer,
 					  dev->devh,
 					  0x81,
-					  dev->xfer_buf[i],
+					  dev->xfer[i].buf,
 					  dev->xfer_buf_len,
 					  _libusb_callback,
-					  (void *)dev,
+					  (void *)&dev->xfer[i],
 					  BULK_TIMEOUT);
 
-		r = libusb_submit_transfer(dev->xfer[i]);
+		dev->xfer[i].status = XFER_SUBMITTED;
+		r = libusb_submit_transfer(dev->xfer[i].usb_xfer);
 		if (r < 0) {
-			fprintf(stderr, "Failed to submit transfer %i!\n", i);
-			dev->async_status = RTLSDR_CANCELING;
+			fprintf(stderr, "Failed to submit transfer %d: %s\n", i, libusb_strerror(r));
+			dev->xfer[i].status = XFER_COMPLETED_ERROR;
+			dev->async_status = RTLSDR_CANCEL_REQUEST;
+			if (r == LIBUSB_TRANSFER_NO_DEVICE)
+				dev->dev_lost = 1;
 			break;
 		}
 	}
 
 	while (RTLSDR_INACTIVE != dev->async_status) {
-		r = libusb_handle_events_timeout_completed(dev->ctx, &tv,
-							   &dev->async_cancel);
-		if (r < 0) {
-			/*fprintf(stderr, "handle_events returned: %d\n", r);*/
-			if (r == LIBUSB_ERROR_INTERRUPTED) /* stray signal */
-				continue;
-			break;
+		if (dev->xfer_head == NULL && dev->async_status != RTLSDR_CANCEL_REQUEST) {
+			dev->async_wakeup = 0;
+			r = libusb_handle_events_timeout_completed(dev->ctx, &tv,
+								   &dev->async_wakeup);
+			if (r < 0) {
+				/*fprintf(stderr, "handle_events returned: %d\n", r);*/
+				if (r == LIBUSB_ERROR_INTERRUPTED) /* stray signal */
+					continue;
+				break;
+			}
 		}
 
-		if (RTLSDR_CANCELING == dev->async_status) {
-			next_status = RTLSDR_INACTIVE;
+		/* Handle unprocessed completed transfers */
+		while (dev->xfer_head) {
+			struct xfer_ctx *head = dev->xfer_head;
+			/*
+			 * We must be in a consistent state here before doing
+			 * the callback, as the callback might call into libusb
+			 * causing other transfers to complete.
+			 */
+			dev->xfer_head = head->next;
+			if (!dev->xfer_head)
+				dev->xfer_tail = NULL;
 
-			if (!dev->xfer)
-				break;
+			/* Don't bother passing data to the callback if we just
+			 * lost the device, the callback will just see errors if
+			 * it tries to do anything with the device.
+			 */
+			if (head->status == XFER_COMPLETED_OK && !dev->dev_lost) {
+				cb(head->buf, head->actual_length, ctx);
+			}
 
-			for(i = 0; i < dev->xfer_buf_num; ++i) {
-				if (!dev->xfer[i])
-					continue;
-
-				if (LIBUSB_TRANSFER_CANCELLED !=
-						dev->xfer[i]->status) {
-					r = libusb_cancel_transfer(dev->xfer[i]);
-					/* handle events after canceling
-					 * to allow transfer status to
-					 * propagate */
-					libusb_handle_events_timeout_completed(dev->ctx,
-									       &zerotv, NULL);
-					if (r < 0)
-						continue;
-
-					next_status = RTLSDR_CANCELING;
+			if (dev->async_status == RTLSDR_RUNNING) {
+				head->status = XFER_SUBMITTED;
+				r = libusb_submit_transfer(head->usb_xfer);
+				if (r < 0) {
+					fprintf(stderr, "rtlsdr_read_async(): failed to resubmit transfer: %s\n", libusb_strerror(r));
+					head->status = XFER_COMPLETED_ERROR;
+					dev->async_status = RTLSDR_CANCEL_REQUEST;
+					if (r == LIBUSB_TRANSFER_NO_DEVICE)
+						dev->dev_lost = 1;
 				}
 			}
+		}
 
-			if (dev->dev_lost || RTLSDR_INACTIVE == next_status) {
-				/* handle any events that still need to
-				 * be handled before exiting after we
-				 * just cancelled all transfers */
-				libusb_handle_events_timeout_completed(dev->ctx,
-								       &zerotv, NULL);
-				break;
+		/* act on cancel requests */
+		if (dev->async_status == RTLSDR_CANCEL_REQUEST) {
+			dev->async_status = RTLSDR_CANCELING;
+			for (i = 0; i < dev->xfer_buf_num; ++i) {
+				if (dev->xfer[i].status == XFER_SUBMITTED) {
+					dev->xfer[i].status = XFER_CANCELING;
+					libusb_cancel_transfer(dev->xfer[i].usb_xfer);
+				}
 			}
+		}
+
+		/* check for completion of cancellation */
+		if (dev->async_status == RTLSDR_CANCELING) {
+			enum rtlsdr_async_status next_state = RTLSDR_INACTIVE;
+			for (i = 0; i < dev->xfer_buf_num; ++i) {
+				if (dev->xfer[i].status == XFER_CANCELING) {
+					next_state = RTLSDR_CANCELING;
+					break;
+				}
+			}
+			dev->async_status = next_state;
 		}
 	}
 
 	_rtlsdr_free_async_buffers(dev);
-
-	dev->async_status = next_status;
+	dev->async_status = RTLSDR_INACTIVE;
 
 	return r;
 }
@@ -1839,20 +1898,18 @@ int rtlsdr_cancel_async(rtlsdr_dev_t *dev)
 	if (!dev)
 		return -1;
 
-	/* if streaming, try to cancel gracefully */
-	if (RTLSDR_RUNNING == dev->async_status) {
-		dev->async_status = RTLSDR_CANCELING;
-		dev->async_cancel = 1;
+	/* already requested? */
+	if (RTLSDR_CANCEL_REQUEST == dev->async_status || RTLSDR_CANCELING == dev->async_status) {
 		return 0;
 	}
 
-	/* if called while in pending state, change the state forcefully */
-#if 0
-	if (RTLSDR_INACTIVE != dev->async_status) {
-		dev->async_status = RTLSDR_INACTIVE;
+	/* if streaming, try to cancel gracefully */
+	if (RTLSDR_RUNNING == dev->async_status) {
+		dev->async_status = RTLSDR_CANCEL_REQUEST;
+		dev->async_wakeup = 1;
 		return 0;
 	}
-#endif
+
 	return -2;
 }
 
