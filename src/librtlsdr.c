@@ -28,6 +28,7 @@
 #define min(a, b) (((a) < (b)) ? (a) : (b))
 #endif
 
+#include <pthread.h>
 #include <libusb.h>
 
 /*
@@ -71,7 +72,8 @@ enum rtlsdr_async_status {
 	RTLSDR_INACTIVE = 0,
 	RTLSDR_CANCEL_REQUEST,
 	RTLSDR_CANCELING,
-	RTLSDR_RUNNING
+	RTLSDR_RUNNING,
+	RTLSDR_CLOSING
 };
 
 #define FIR_LEN 16
@@ -100,17 +102,40 @@ struct xfer_ctx {
 	struct libusb_transfer *usb_xfer;  /* the bulk transfer */
 	unsigned char *buf;                /* the associated data buffer */
 	enum {
-		XFER_IDLE,           /* newly created */
-		XFER_SUBMITTED,      /* transfer submitted, awaiting completion */
-		XFER_CANCELING,      /* transfer cancelled, awaiting completion */
-		XFER_COMPLETED_OK,   /* transfer completed OK */
-		XFER_COMPLETED_ERROR /* transfer completed with an error */
+		XFER_IDLE,              /* newly created */
+		XFER_SUBMITTED,         /* transfer submitted, awaiting completion */
+		XFER_CANCELING,         /* transfer cancelled, awaiting completion */
+		XFER_COMPLETED_OK,      /* transfer completed OK */
+		XFER_COMPLETED_ERROR,   /* transfer completed with an error */
+		XFER_COMPLETED_DEV_LOST /* transfer completed with an error that indicated we lost the device */
 	} status;
 	unsigned int actual_length;  /* if XFER_COMPLETED_OK, valid data length  */
 	struct xfer_ctx *next;       /* if XFER_COMPLETED_*, next unhandled completed transfer in the list */
 };
 
+/*
+ * dev_mutex protects access to almost all device/tuner state.
+ *
+ * async_mutex protects access to the async state
+ * while rtlsdr_read_async() is active:
+ *
+ *   async_status
+ *   async_wakeup
+ *   async_thread_id
+ *   xfer (and contents)
+ *   xfer_head
+ *   xfer_tail
+ *   xfer_errors
+ *
+ * async_mutex must not be held when calling libusb_handle_events_*;
+ * it is acquired within the libusb callback.
+ *
+ * You must not acquire dev_mutex while holding async_mutex.
+ */
 struct rtlsdr_dev {
+	pthread_mutex_t dev_mutex;
+	pthread_mutex_t async_mutex;
+
 	libusb_context *ctx;
 	struct libusb_device_handle *devh;
 	uint32_t xfer_buf_num;
@@ -119,6 +144,7 @@ struct rtlsdr_dev {
 	struct xfer_ctx *xfer_head;  /* first unhandled completed transfer */
 	struct xfer_ctx *xfer_tail;  /* last unhandled completed transfer */
 	enum rtlsdr_async_status async_status;
+	pthread_t async_thread_id;
 	int async_wakeup;
 	/* rtl demod context */
 	uint32_t rate; /* Hz */
@@ -142,26 +168,35 @@ struct rtlsdr_dev {
 	unsigned int xfer_errors;
 };
 
-void rtlsdr_set_gpio_bit(rtlsdr_dev_t *dev, uint8_t gpio, int val);
+static void pthread_mutex_init_recursive(pthread_mutex_t *m)
+{
+	pthread_mutexattr_t attrs;
+	pthread_mutexattr_init(&attrs);
+	pthread_mutexattr_settype(&attrs, PTHREAD_MUTEX_RECURSIVE_NP);
+	pthread_mutex_init(m, &attrs);
+	pthread_mutexattr_destroy(&attrs);
+}
+
+static void rtlsdr_set_gpio_bit(rtlsdr_dev_t *dev, uint8_t gpio, int val);
 
 /* generic tuner interface functions, shall be moved to the tuner implementations */
-int e4000_init(void *dev) {
+static int e4000_init(void *dev) {
 	rtlsdr_dev_t* devt = (rtlsdr_dev_t*)dev;
 	devt->e4k_s.i2c_addr = E4K_I2C_ADDR;
 	rtlsdr_get_xtal_freq(devt, NULL, &devt->e4k_s.vco.fosc);
 	devt->e4k_s.rtl_dev = dev;
 	return e4k_init(&devt->e4k_s);
 }
-int e4000_exit(void *dev) {
+static int e4000_exit(void *dev) {
 	rtlsdr_dev_t* devt = (rtlsdr_dev_t*)dev;
 	return e4k_standby(&devt->e4k_s, 1);
 }
-int e4000_set_freq(void *dev, uint32_t freq) {
+static int e4000_set_freq(void *dev, uint32_t freq) {
 	rtlsdr_dev_t* devt = (rtlsdr_dev_t*)dev;
 	return e4k_tune_freq(&devt->e4k_s, freq);
 }
 
-int e4000_set_bw(void *dev, int bw) {
+static int e4000_set_bw(void *dev, int bw) {
 	int r = 0;
 	rtlsdr_dev_t* devt = (rtlsdr_dev_t*)dev;
 
@@ -172,7 +207,7 @@ int e4000_set_bw(void *dev, int bw) {
 	return r;
 }
 
-int e4000_set_gain(void *dev, int gain) {
+static int e4000_set_gain(void *dev, int gain) {
 	rtlsdr_dev_t* devt = (rtlsdr_dev_t*)dev;
 	int mixgain = (gain > 340) ? 12 : 4;
 #if 0
@@ -189,44 +224,44 @@ int e4000_set_gain(void *dev, int gain) {
 #endif
 	return 0;
 }
-int e4000_set_if_gain(void *dev, int stage, int gain) {
+static int e4000_set_if_gain(void *dev, int stage, int gain) {
 	rtlsdr_dev_t* devt = (rtlsdr_dev_t*)dev;
 	return e4k_if_gain_set(&devt->e4k_s, (uint8_t)stage, (int8_t)(gain / 10));
 }
-int e4000_set_gain_mode(void *dev, int manual) {
+static int e4000_set_gain_mode(void *dev, int manual) {
 	rtlsdr_dev_t* devt = (rtlsdr_dev_t*)dev;
 	return e4k_enable_manual_gain(&devt->e4k_s, manual);
 }
 
-int _fc0012_init(void *dev) { return fc0012_init(dev); }
-int fc0012_exit(void *dev) { return 0; }
-int fc0012_set_freq(void *dev, uint32_t freq) {
+static int _fc0012_init(void *dev) { return fc0012_init(dev); }
+static int fc0012_exit(void *dev) { return 0; }
+static int fc0012_set_freq(void *dev, uint32_t freq) {
 	/* select V-band/U-band filter */
 	rtlsdr_set_gpio_bit(dev, 6, (freq > 300000000) ? 1 : 0);
 	return fc0012_set_params(dev, freq, 6000000);
 }
-int fc0012_set_bw(void *dev, int bw) { return 0; }
-int _fc0012_set_gain(void *dev, int gain) { return fc0012_set_gain(dev, gain); }
-int fc0012_set_gain_mode(void *dev, int manual) { return 0; }
+static int fc0012_set_bw(void *dev, int bw) { return 0; }
+static int _fc0012_set_gain(void *dev, int gain) { return fc0012_set_gain(dev, gain); }
+static int fc0012_set_gain_mode(void *dev, int manual) { return 0; }
 
-int _fc0013_init(void *dev) { return fc0013_init(dev); }
-int fc0013_exit(void *dev) { return 0; }
-int fc0013_set_freq(void *dev, uint32_t freq) {
+static int _fc0013_init(void *dev) { return fc0013_init(dev); }
+static int fc0013_exit(void *dev) { return 0; }
+static int fc0013_set_freq(void *dev, uint32_t freq) {
 	return fc0013_set_params(dev, freq, 6000000);
 }
-int fc0013_set_bw(void *dev, int bw) { return 0; }
-int _fc0013_set_gain(void *dev, int gain) { return fc0013_set_lna_gain(dev, gain); }
+static int fc0013_set_bw(void *dev, int bw) { return 0; }
+static int _fc0013_set_gain(void *dev, int gain) { return fc0013_set_lna_gain(dev, gain); }
 
-int fc2580_init(void *dev) { return fc2580_Initialize(dev); }
-int fc2580_exit(void *dev) { return 0; }
-int _fc2580_set_freq(void *dev, uint32_t freq) {
+static int fc2580_init(void *dev) { return fc2580_Initialize(dev); }
+static int fc2580_exit(void *dev) { return 0; }
+static int _fc2580_set_freq(void *dev, uint32_t freq) {
 	return fc2580_SetRfFreqHz(dev, freq);
 }
-int fc2580_set_bw(void *dev, int bw) { return fc2580_SetBandwidthMode(dev, 1); }
-int fc2580_set_gain(void *dev, int gain) { return 0; }
-int fc2580_set_gain_mode(void *dev, int manual) { return 0; }
+static int fc2580_set_bw(void *dev, int bw) { return fc2580_SetBandwidthMode(dev, 1); }
+static int fc2580_set_gain(void *dev, int gain) { return 0; }
+static int fc2580_set_gain_mode(void *dev, int manual) { return 0; }
 
-int r820t_init(void *dev) {
+static int r820t_init(void *dev) {
 	rtlsdr_dev_t* devt = (rtlsdr_dev_t*)dev;
 	devt->r82xx_p.rtl_dev = dev;
 
@@ -246,21 +281,21 @@ int r820t_init(void *dev) {
 
 	return r82xx_init(&devt->r82xx_p);
 }
-int r820t_exit(void *dev) {
+static int r820t_exit(void *dev) {
 	rtlsdr_dev_t* devt = (rtlsdr_dev_t*)dev;
 	return r82xx_standby(&devt->r82xx_p);
 }
 
-int r820t_set_freq(void *dev, uint32_t freq) {
+static int r820t_set_freq(void *dev, uint32_t freq) {
 	rtlsdr_dev_t* devt = (rtlsdr_dev_t*)dev;
 	return r82xx_set_freq(&devt->r82xx_p, freq);
 }
-int r820t_set_bw(void *dev, int bw) { return 0; }
-int r820t_set_gain(void *dev, int gain) {
+static int r820t_set_bw(void *dev, int bw) { return 0; }
+static int r820t_set_gain(void *dev, int gain) {
 	rtlsdr_dev_t* devt = (rtlsdr_dev_t*)dev;
 	return r82xx_set_gain(&devt->r82xx_p, 1, gain);
 }
-int r820t_set_gain_mode(void *dev, int manual) {
+static int r820t_set_gain_mode(void *dev, int manual) {
 	rtlsdr_dev_t* devt = (rtlsdr_dev_t*)dev;
 	return r82xx_set_gain(&devt->r82xx_p, manual, 0);
 }
@@ -406,7 +441,7 @@ enum blocks {
 	IICB			= 6,
 };
 
-int rtlsdr_read_array(rtlsdr_dev_t *dev, uint8_t block, uint16_t addr, uint8_t *array, uint8_t len)
+static int rtlsdr_read_array(rtlsdr_dev_t *dev, uint8_t block, uint16_t addr, uint8_t *array, uint8_t len)
 {
 	int r;
 	uint16_t index = (block << 8);
@@ -416,10 +451,13 @@ int rtlsdr_read_array(rtlsdr_dev_t *dev, uint8_t block, uint16_t addr, uint8_t *
 	if (r < 0)
 		fprintf(stderr, "%s failed with %d\n", __FUNCTION__, r);
 #endif
+	if (r == LIBUSB_ERROR_NO_DEVICE)
+		dev->dev_lost = 1;
+
 	return r;
 }
 
-int rtlsdr_write_array(rtlsdr_dev_t *dev, uint8_t block, uint16_t addr, uint8_t *array, uint8_t len)
+static int rtlsdr_write_array(rtlsdr_dev_t *dev, uint8_t block, uint16_t addr, uint8_t *array, uint8_t len)
 {
 	int r;
 	uint16_t index = (block << 8) | 0x10;
@@ -429,10 +467,12 @@ int rtlsdr_write_array(rtlsdr_dev_t *dev, uint8_t block, uint16_t addr, uint8_t 
 	if (r < 0)
 		fprintf(stderr, "%s failed with %d\n", __FUNCTION__, r);
 #endif
+	if (r == LIBUSB_ERROR_NO_DEVICE)
+		dev->dev_lost = 1;
 	return r;
 }
 
-int rtlsdr_i2c_write_reg(rtlsdr_dev_t *dev, uint8_t i2c_addr, uint8_t reg, uint8_t val)
+static int rtlsdr_i2c_write_reg(rtlsdr_dev_t *dev, uint8_t i2c_addr, uint8_t reg, uint8_t val)
 {
 	uint16_t addr = i2c_addr;
 	uint8_t data[2];
@@ -442,18 +482,21 @@ int rtlsdr_i2c_write_reg(rtlsdr_dev_t *dev, uint8_t i2c_addr, uint8_t reg, uint8
 	return rtlsdr_write_array(dev, IICB, addr, (uint8_t *)&data, 2);
 }
 
-uint8_t rtlsdr_i2c_read_reg(rtlsdr_dev_t *dev, uint8_t i2c_addr, uint8_t reg)
+static uint8_t rtlsdr_i2c_read_reg(rtlsdr_dev_t *dev, uint8_t i2c_addr, uint8_t reg)
 {
 	uint16_t addr = i2c_addr;
 	uint8_t data = 0;
 
-	rtlsdr_write_array(dev, IICB, addr, &reg, 1);
-	rtlsdr_read_array(dev, IICB, addr, &data, 1);
+	if (rtlsdr_write_array(dev, IICB, addr, &reg, 1) < 0)
+		return 0;
+
+	if (rtlsdr_read_array(dev, IICB, addr, &data, 1) < 0)
+		return 0;
 
 	return data;
 }
 
-int rtlsdr_i2c_write(rtlsdr_dev_t *dev, uint8_t i2c_addr, uint8_t *buffer, int len)
+static int rtlsdr_i2c_write(rtlsdr_dev_t *dev, uint8_t i2c_addr, uint8_t *buffer, int len)
 {
 	uint16_t addr = i2c_addr;
 
@@ -463,7 +506,7 @@ int rtlsdr_i2c_write(rtlsdr_dev_t *dev, uint8_t i2c_addr, uint8_t *buffer, int l
 	return rtlsdr_write_array(dev, IICB, addr, buffer, len);
 }
 
-int rtlsdr_i2c_read(rtlsdr_dev_t *dev, uint8_t i2c_addr, uint8_t *buffer, int len)
+static int rtlsdr_i2c_read(rtlsdr_dev_t *dev, uint8_t i2c_addr, uint8_t *buffer, int len)
 {
 	uint16_t addr = i2c_addr;
 
@@ -473,7 +516,7 @@ int rtlsdr_i2c_read(rtlsdr_dev_t *dev, uint8_t i2c_addr, uint8_t *buffer, int le
 	return rtlsdr_read_array(dev, IICB, addr, buffer, len);
 }
 
-uint16_t rtlsdr_read_reg(rtlsdr_dev_t *dev, uint8_t block, uint16_t addr, uint8_t len)
+static uint16_t rtlsdr_read_reg(rtlsdr_dev_t *dev, uint8_t block, uint16_t addr, uint8_t len)
 {
 	int r;
 	unsigned char data[2];
@@ -482,15 +525,20 @@ uint16_t rtlsdr_read_reg(rtlsdr_dev_t *dev, uint8_t block, uint16_t addr, uint8_
 
 	r = libusb_control_transfer(dev->devh, CTRL_IN, 0, addr, index, data, len, CTRL_TIMEOUT);
 
-	if (r < 0)
+	if (r == LIBUSB_ERROR_NO_DEVICE)
+		dev->dev_lost = 1;
+
+	if (r < 0) {
 		fprintf(stderr, "%s failed with %d\n", __FUNCTION__, r);
+		return 0;
+	}
 
 	reg = (data[1] << 8) | data[0];
 
 	return reg;
 }
 
-int rtlsdr_write_reg(rtlsdr_dev_t *dev, uint8_t block, uint16_t addr, uint16_t val, uint8_t len)
+static int rtlsdr_write_reg(rtlsdr_dev_t *dev, uint8_t block, uint16_t addr, uint16_t val, uint8_t len)
 {
 	int r;
 	unsigned char data[2];
@@ -506,13 +554,16 @@ int rtlsdr_write_reg(rtlsdr_dev_t *dev, uint8_t block, uint16_t addr, uint16_t v
 
 	r = libusb_control_transfer(dev->devh, CTRL_OUT, 0, addr, index, data, len, CTRL_TIMEOUT);
 
+	if (r == LIBUSB_ERROR_NO_DEVICE)
+		dev->dev_lost = 1;
+
 	if (r < 0)
 		fprintf(stderr, "%s failed with %d\n", __FUNCTION__, r);
 
 	return r;
 }
 
-uint16_t rtlsdr_demod_read_reg(rtlsdr_dev_t *dev, uint8_t page, uint16_t addr, uint8_t len)
+static uint16_t rtlsdr_demod_read_reg(rtlsdr_dev_t *dev, uint8_t page, uint16_t addr, uint8_t len)
 {
 	int r;
 	unsigned char data[2];
@@ -523,6 +574,9 @@ uint16_t rtlsdr_demod_read_reg(rtlsdr_dev_t *dev, uint8_t page, uint16_t addr, u
 
 	r = libusb_control_transfer(dev->devh, CTRL_IN, 0, addr, index, data, len, CTRL_TIMEOUT);
 
+	if (r == LIBUSB_ERROR_NO_DEVICE)
+		dev->dev_lost = 1;
+
 	if (r < 0)
 		fprintf(stderr, "%s failed with %d\n", __FUNCTION__, r);
 
@@ -531,7 +585,7 @@ uint16_t rtlsdr_demod_read_reg(rtlsdr_dev_t *dev, uint8_t page, uint16_t addr, u
 	return reg;
 }
 
-int rtlsdr_demod_write_reg(rtlsdr_dev_t *dev, uint8_t page, uint16_t addr, uint16_t val, uint8_t len)
+static int rtlsdr_demod_write_reg(rtlsdr_dev_t *dev, uint8_t page, uint16_t addr, uint16_t val, uint8_t len)
 {
 	int r;
 	unsigned char data[2];
@@ -547,15 +601,20 @@ int rtlsdr_demod_write_reg(rtlsdr_dev_t *dev, uint8_t page, uint16_t addr, uint1
 
 	r = libusb_control_transfer(dev->devh, CTRL_OUT, 0, addr, index, data, len, CTRL_TIMEOUT);
 
-	if (r < 0)
+	if (r == LIBUSB_ERROR_NO_DEVICE)
+		dev->dev_lost = 1;
+
+	if (r < 0) {
 		fprintf(stderr, "%s failed with %d\n", __FUNCTION__, r);
+		return r;
+	}
 
 	rtlsdr_demod_read_reg(dev, 0x0a, 0x01, 1);
 
 	return (r == len) ? 0 : -1;
 }
 
-void rtlsdr_set_gpio_bit(rtlsdr_dev_t *dev, uint8_t gpio, int val)
+static void rtlsdr_set_gpio_bit(rtlsdr_dev_t *dev, uint8_t gpio, int val)
 {
 	uint16_t r;
 
@@ -565,7 +624,7 @@ void rtlsdr_set_gpio_bit(rtlsdr_dev_t *dev, uint8_t gpio, int val)
 	rtlsdr_write_reg(dev, SYSB, GPO, r, 1);
 }
 
-void rtlsdr_set_gpio_output(rtlsdr_dev_t *dev, uint8_t gpio)
+static void rtlsdr_set_gpio_output(rtlsdr_dev_t *dev, uint8_t gpio)
 {
 	int r;
 	gpio = 1 << gpio;
@@ -576,12 +635,12 @@ void rtlsdr_set_gpio_output(rtlsdr_dev_t *dev, uint8_t gpio)
 	rtlsdr_write_reg(dev, SYSB, GPOE, r | gpio, 1);
 }
 
-void rtlsdr_set_i2c_repeater(rtlsdr_dev_t *dev, int on)
+static void rtlsdr_set_i2c_repeater(rtlsdr_dev_t *dev, int on)
 {
 	rtlsdr_demod_write_reg(dev, 1, 0x01, on ? 0x18 : 0x10, 1);
 }
 
-int rtlsdr_set_fir(rtlsdr_dev_t *dev)
+static int rtlsdr_set_fir(rtlsdr_dev_t *dev)
 {
 	uint8_t fir[20];
 
@@ -614,7 +673,7 @@ int rtlsdr_set_fir(rtlsdr_dev_t *dev)
 	return 0;
 }
 
-void rtlsdr_init_baseband(rtlsdr_dev_t *dev)
+static void rtlsdr_init_baseband(rtlsdr_dev_t *dev)
 {
 	unsigned int i;
 
@@ -668,7 +727,7 @@ void rtlsdr_init_baseband(rtlsdr_dev_t *dev)
 	rtlsdr_demod_write_reg(dev, 0, 0x0d, 0x83, 1);
 }
 
-int rtlsdr_deinit_baseband(rtlsdr_dev_t *dev)
+static int rtlsdr_deinit_baseband(rtlsdr_dev_t *dev)
 {
 	int r = 0;
 
@@ -687,7 +746,7 @@ int rtlsdr_deinit_baseband(rtlsdr_dev_t *dev)
 	return r;
 }
 
-int rtlsdr_set_if_freq(rtlsdr_dev_t *dev, uint32_t freq)
+static int rtlsdr_set_if_freq(rtlsdr_dev_t *dev, uint32_t freq)
 {
 	uint32_t rtl_xtal;
 	int32_t if_freq;
@@ -713,7 +772,7 @@ int rtlsdr_set_if_freq(rtlsdr_dev_t *dev, uint32_t freq)
 	return r;
 }
 
-int rtlsdr_set_sample_freq_correction(rtlsdr_dev_t *dev, int ppm)
+static int rtlsdr_set_sample_freq_correction(rtlsdr_dev_t *dev, int ppm)
 {
 	int r = 0;
 	uint8_t tmp;
@@ -734,9 +793,18 @@ int rtlsdr_set_xtal_freq(rtlsdr_dev_t *dev, uint32_t rtl_freq, uint32_t tuner_fr
 	if (!dev)
 		return -1;
 
+	pthread_mutex_lock(&dev->dev_mutex);
+	if (dev->dev_lost) {
+		r = -1;
+		goto out;
+	}
+
+
 	if (rtl_freq > 0 &&
-		(rtl_freq < MIN_RTL_XTAL_FREQ || rtl_freq > MAX_RTL_XTAL_FREQ))
-		return -2;
+	    (rtl_freq < MIN_RTL_XTAL_FREQ || rtl_freq > MAX_RTL_XTAL_FREQ)) {
+		r = -2;
+		goto out;
+	}
 
 	if (rtl_freq > 0 && dev->rtl_xtal != rtl_freq) {
 		dev->rtl_xtal = rtl_freq;
@@ -754,23 +822,36 @@ int rtlsdr_set_xtal_freq(rtlsdr_dev_t *dev, uint32_t rtl_freq, uint32_t tuner_fr
 
 		/* read corrected clock value into e4k and r82xx structure */
 		if (rtlsdr_get_xtal_freq(dev, NULL, &dev->e4k_s.vco.fosc) ||
-		    rtlsdr_get_xtal_freq(dev, NULL, &dev->r82xx_c.xtal))
-			return -3;
+		    rtlsdr_get_xtal_freq(dev, NULL, &dev->r82xx_c.xtal)) {
+			r = -3;
+			goto out;
+		}
 
 		/* update xtal-dependent settings */
 		if (dev->freq)
 			r = rtlsdr_set_center_freq(dev, dev->freq);
 	}
 
+ out:
+	pthread_mutex_unlock(&dev->dev_mutex);
 	return r;
 }
 
 int rtlsdr_get_xtal_freq(rtlsdr_dev_t *dev, uint32_t *rtl_freq, uint32_t *tuner_freq)
 {
+	int r = 0;
+
 	if (!dev)
 		return -1;
 
-	#define APPLY_PPM_CORR(val,ppm) (((val) * (1.0 + (ppm) / 1e6)))
+	pthread_mutex_lock(&dev->dev_mutex);
+	if (dev->dev_lost) {
+		r = -1;
+		goto out;
+	}
+
+#define APPLY_PPM_CORR(val,ppm) (((val) * (1.0 + (ppm) / 1e6)))
+
 
 	if (rtl_freq)
 		*rtl_freq = (uint32_t) APPLY_PPM_CORR(dev->rtl_xtal, dev->corr);
@@ -778,7 +859,9 @@ int rtlsdr_get_xtal_freq(rtlsdr_dev_t *dev, uint32_t *rtl_freq, uint32_t *tuner_
 	if (tuner_freq)
 		*tuner_freq = (uint32_t) APPLY_PPM_CORR(dev->tun_xtal, dev->corr);
 
-	return 0;
+ out:
+	pthread_mutex_unlock(&dev->dev_mutex);
+	return r;
 }
 
 int rtlsdr_get_usb_strings(rtlsdr_dev_t *dev, char *manufact, char *product,
@@ -789,14 +872,20 @@ int rtlsdr_get_usb_strings(rtlsdr_dev_t *dev, char *manufact, char *product,
 	const int buf_max = 256;
 	int r = 0;
 
-	if (!dev || !dev->devh)
+	if (!dev)
 		return -1;
+
+	pthread_mutex_lock(&dev->dev_mutex);
+	if (dev->dev_lost) {
+		r = -1;
+		goto out;
+	}
 
 	device = libusb_get_device(dev->devh);
 
 	r = libusb_get_device_descriptor(device, &dd);
 	if (r < 0)
-		return -1;
+		goto out;
 
 	if (manufact) {
 		memset(manufact, 0, buf_max);
@@ -819,7 +908,9 @@ int rtlsdr_get_usb_strings(rtlsdr_dev_t *dev, char *manufact, char *product,
 						   buf_max);
 	}
 
-	return 0;
+ out:
+	pthread_mutex_unlock(&dev->dev_mutex);
+	return r;
 }
 
 int rtlsdr_write_eeprom(rtlsdr_dev_t *dev, uint8_t *data, uint8_t offset, uint16_t len)
@@ -834,6 +925,8 @@ int rtlsdr_write_eeprom(rtlsdr_dev_t *dev, uint8_t *data, uint8_t offset, uint16
 	if ((len + offset) > 256)
 		return -2;
 
+	pthread_mutex_lock(&dev->dev_mutex);
+
 	for (i = 0; i < len; i++) {
 		cmd[0] = i + offset;
 		r = rtlsdr_write_array(dev, IICB, EEPROM_ADDR, cmd, 1);
@@ -845,8 +938,10 @@ int rtlsdr_write_eeprom(rtlsdr_dev_t *dev, uint8_t *data, uint8_t offset, uint16
 
 		cmd[1] = data[i];
 		r = rtlsdr_write_array(dev, IICB, EEPROM_ADDR, cmd, 2);
-		if (r != sizeof(cmd))
-			return -3;
+		if (r != sizeof(cmd)) {
+			r = -3;
+			goto out;
+		}
 
 		/* for some EEPROMs (e.g. ATC 240LC02) we need a delay
 		 * between write operations, otherwise they will fail */
@@ -857,7 +952,9 @@ int rtlsdr_write_eeprom(rtlsdr_dev_t *dev, uint8_t *data, uint8_t offset, uint16
 #endif
 	}
 
-	return 0;
+ out:
+	pthread_mutex_unlock(&dev->dev_mutex);
+	return r;
 }
 
 int rtlsdr_read_eeprom(rtlsdr_dev_t *dev, uint8_t *data, uint8_t offset, uint16_t len)
@@ -871,17 +968,25 @@ int rtlsdr_read_eeprom(rtlsdr_dev_t *dev, uint8_t *data, uint8_t offset, uint16_
 	if ((len + offset) > 256)
 		return -2;
 
+	pthread_mutex_lock(&dev->dev_mutex);
+	if (dev->dev_lost) {
+		r = -1;
+		goto out;
+	}
+
 	r = rtlsdr_write_array(dev, IICB, EEPROM_ADDR, &offset, 1);
 	if (r < 0)
-		return -3;
+		goto out;
 
 	for (i = 0; i < len; i++) {
 		r = rtlsdr_read_array(dev, IICB, EEPROM_ADDR, data + i, 1);
 
 		if (r < 0)
-			return -3;
+			goto out;
 	}
 
+ out:
+	pthread_mutex_unlock(&dev->dev_mutex);
 	return r;
 }
 
@@ -891,6 +996,10 @@ int rtlsdr_set_center_freq(rtlsdr_dev_t *dev, uint32_t freq)
 
 	if (!dev || !dev->tuner)
 		return -1;
+
+	pthread_mutex_lock(&dev->dev_mutex);
+	if (dev->dev_lost)
+		goto out;
 
 	if (dev->direct_sampling) {
 		r = rtlsdr_set_if_freq(dev, freq);
@@ -905,15 +1014,23 @@ int rtlsdr_set_center_freq(rtlsdr_dev_t *dev, uint32_t freq)
 	else
 		dev->freq = 0;
 
+ out:
+	pthread_mutex_unlock(&dev->dev_mutex);
 	return r;
 }
 
 uint32_t rtlsdr_get_center_freq(rtlsdr_dev_t *dev)
 {
+	uint32_t f;
+
 	if (!dev)
 		return 0;
 
-	return dev->freq;
+	pthread_mutex_lock(&dev->dev_mutex);
+	f = dev->freq;
+	pthread_mutex_unlock(&dev->dev_mutex);
+
+	return f;
 }
 
 int rtlsdr_set_freq_correction(rtlsdr_dev_t *dev, int ppm)
@@ -923,8 +1040,16 @@ int rtlsdr_set_freq_correction(rtlsdr_dev_t *dev, int ppm)
 	if (!dev)
 		return -1;
 
-	if (dev->corr == ppm)
-		return -2;
+	pthread_mutex_lock(&dev->dev_mutex);
+	if (dev->dev_lost) {
+		r = -1;
+		goto out;
+	}
+
+	if (dev->corr == ppm) {
+		r = -2;
+		goto out;
+	}
 
 	dev->corr = ppm;
 
@@ -932,21 +1057,31 @@ int rtlsdr_set_freq_correction(rtlsdr_dev_t *dev, int ppm)
 
 	/* read corrected clock value into e4k and r82xx structure */
 	if (rtlsdr_get_xtal_freq(dev, NULL, &dev->e4k_s.vco.fosc) ||
-	    rtlsdr_get_xtal_freq(dev, NULL, &dev->r82xx_c.xtal))
-		return -3;
+	    rtlsdr_get_xtal_freq(dev, NULL, &dev->r82xx_c.xtal)) {
+		r = -3;
+		goto out;
+	}
 
 	if (dev->freq) /* retune to apply new correction value */
 		r |= rtlsdr_set_center_freq(dev, dev->freq);
 
+ out:
+	pthread_mutex_unlock(&dev->dev_mutex);
 	return r;
 }
 
 int rtlsdr_get_freq_correction(rtlsdr_dev_t *dev)
 {
+	int c;
+
 	if (!dev)
 		return 0;
 
-	return dev->corr;
+	pthread_mutex_lock(&dev->dev_mutex);
+	c = dev->corr;
+	pthread_mutex_unlock(&dev->dev_mutex);
+
+	return c;
 }
 
 enum rtlsdr_tuner rtlsdr_get_tuner_type(rtlsdr_dev_t *dev)
@@ -1018,6 +1153,12 @@ int rtlsdr_set_tuner_gain(rtlsdr_dev_t *dev, int gain)
 	if (!dev || !dev->tuner)
 		return -1;
 
+	pthread_mutex_lock(&dev->dev_mutex);
+	if (dev->dev_lost) {
+		r = -1;
+		goto out;
+	}
+
 	if (dev->tuner->set_gain) {
 		rtlsdr_set_i2c_repeater(dev, 1);
 		r = dev->tuner->set_gain((void *)dev, gain);
@@ -1029,15 +1170,23 @@ int rtlsdr_set_tuner_gain(rtlsdr_dev_t *dev, int gain)
 	else
 		dev->gain = 0;
 
+ out:
+	pthread_mutex_unlock(&dev->dev_mutex);
 	return r;
 }
 
 int rtlsdr_get_tuner_gain(rtlsdr_dev_t *dev)
 {
+	int g;
+
 	if (!dev)
 		return 0;
 
-	return dev->gain;
+	pthread_mutex_lock(&dev->dev_mutex);
+	g = dev->gain;
+	pthread_mutex_unlock(&dev->dev_mutex);
+
+	return g;
 }
 
 int rtlsdr_set_tuner_if_gain(rtlsdr_dev_t *dev, int stage, int gain)
@@ -1047,12 +1196,20 @@ int rtlsdr_set_tuner_if_gain(rtlsdr_dev_t *dev, int stage, int gain)
 	if (!dev || !dev->tuner)
 		return -1;
 
+	pthread_mutex_lock(&dev->dev_mutex);
+	if (dev->dev_lost) {
+		r = -1;
+		goto out;
+	}
+
 	if (dev->tuner->set_if_gain) {
 		rtlsdr_set_i2c_repeater(dev, 1);
 		r = dev->tuner->set_if_gain(dev, stage, gain);
 		rtlsdr_set_i2c_repeater(dev, 0);
 	}
 
+ out:
+	pthread_mutex_unlock(&dev->dev_mutex);
 	return r;
 }
 
@@ -1063,12 +1220,20 @@ int rtlsdr_set_tuner_gain_mode(rtlsdr_dev_t *dev, int mode)
 	if (!dev || !dev->tuner)
 		return -1;
 
+	pthread_mutex_lock(&dev->dev_mutex);
+	if (dev->dev_lost) {
+		r = -1;
+		goto out;
+	}
+
 	if (dev->tuner->set_gain_mode) {
 		rtlsdr_set_i2c_repeater(dev, 1);
 		r = dev->tuner->set_gain_mode((void *)dev, mode);
 		rtlsdr_set_i2c_repeater(dev, 0);
 	}
 
+ out:
+	pthread_mutex_unlock(&dev->dev_mutex);
 	return r;
 }
 
@@ -1082,11 +1247,18 @@ int rtlsdr_set_sample_rate(rtlsdr_dev_t *dev, uint32_t samp_rate)
 	if (!dev)
 		return -1;
 
+	pthread_mutex_lock(&dev->dev_mutex);
+	if (dev->dev_lost) {
+		r = -1;
+		goto out;
+	}
+
 	/* check if the rate is supported by the resampler */
 	if ((samp_rate <= 225000) || (samp_rate > 3200000) ||
 	   ((samp_rate > 300000) && (samp_rate <= 900000))) {
 		fprintf(stderr, "Invalid sample rate: %u Hz\n", samp_rate);
-		return -EINVAL;
+		r = -EINVAL;
+		goto out;
 	}
 
 	rsamp_ratio = (dev->rtl_xtal * TWO_POW(22)) / samp_rate;
@@ -1121,31 +1293,63 @@ int rtlsdr_set_sample_rate(rtlsdr_dev_t *dev, uint32_t samp_rate)
 	if (dev->offs_freq)
 		rtlsdr_set_offset_tuning(dev, 1);
 
+ out:
+	pthread_mutex_unlock(&dev->dev_mutex);
 	return r;
 }
 
 uint32_t rtlsdr_get_sample_rate(rtlsdr_dev_t *dev)
 {
+	uint32_t r;
+
 	if (!dev)
 		return 0;
 
-	return dev->rate;
+	pthread_mutex_lock(&dev->dev_mutex);
+	r = dev->rate;
+	pthread_mutex_unlock(&dev->dev_mutex);
+
+	return r;
 }
 
 int rtlsdr_set_testmode(rtlsdr_dev_t *dev, int on)
 {
+	int r;
+
 	if (!dev)
 		return -1;
 
-	return rtlsdr_demod_write_reg(dev, 0, 0x19, on ? 0x03 : 0x05, 1);
+	pthread_mutex_lock(&dev->dev_mutex);
+	if (dev->dev_lost) {
+		r = -1;
+		goto out;
+	}
+
+	r = rtlsdr_demod_write_reg(dev, 0, 0x19, on ? 0x03 : 0x05, 1);
+
+ out:
+	pthread_mutex_unlock(&dev->dev_mutex);
+	return r;
 }
 
 int rtlsdr_set_agc_mode(rtlsdr_dev_t *dev, int on)
 {
+	int r;
+
 	if (!dev)
 		return -1;
 
-	return rtlsdr_demod_write_reg(dev, 0, 0x19, on ? 0x25 : 0x05, 1);
+	pthread_mutex_lock(&dev->dev_mutex);
+	if (dev->dev_lost) {
+		r = -1;
+		goto out;
+	}
+
+	r = rtlsdr_demod_write_reg(dev, 0, 0x19, on ? 0x25 : 0x05, 1);
+
+ out:
+	pthread_mutex_unlock(&dev->dev_mutex);
+	return r;
 }
 
 int rtlsdr_set_direct_sampling(rtlsdr_dev_t *dev, int on)
@@ -1154,6 +1358,12 @@ int rtlsdr_set_direct_sampling(rtlsdr_dev_t *dev, int on)
 
 	if (!dev)
 		return -1;
+
+	pthread_mutex_lock(&dev->dev_mutex);
+	if (dev->dev_lost) {
+		r = -1;
+		goto out;
+	}
 
 	if (on) {
 		if (dev->tuner && dev->tuner->exit) {
@@ -1208,15 +1418,23 @@ int rtlsdr_set_direct_sampling(rtlsdr_dev_t *dev, int on)
 
 	r |= rtlsdr_set_center_freq(dev, dev->freq);
 
+ out:
+	pthread_mutex_unlock(&dev->dev_mutex);
 	return r;
 }
 
 int rtlsdr_get_direct_sampling(rtlsdr_dev_t *dev)
 {
+	int ds;
+
 	if (!dev)
 		return -1;
 
-	return dev->direct_sampling;
+	pthread_mutex_lock(&dev->dev_mutex);
+	ds = dev->direct_sampling;
+	pthread_mutex_unlock(&dev->dev_mutex);
+
+	return ds;
 }
 
 int rtlsdr_set_offset_tuning(rtlsdr_dev_t *dev, int on)
@@ -1230,8 +1448,16 @@ int rtlsdr_set_offset_tuning(rtlsdr_dev_t *dev, int on)
 	    (dev->tuner_type == RTLSDR_TUNER_R828D))
 		return -2;
 
-	if (dev->direct_sampling)
-		return -3;
+	pthread_mutex_lock(&dev->dev_mutex);
+	if (dev->dev_lost) {
+		r = -1;
+		goto out;
+	}
+
+	if (dev->direct_sampling) {
+		r = -3;
+		goto out;
+	}
 
 	/* based on keenerds 1/f noise measurements */
 	dev->offs_freq = on ? ((dev->rate / 2) * 170 / 100) : 0;
@@ -1246,15 +1472,23 @@ int rtlsdr_set_offset_tuning(rtlsdr_dev_t *dev, int on)
 	if (dev->freq > dev->offs_freq)
 		r |= rtlsdr_set_center_freq(dev, dev->freq);
 
+ out:
+	pthread_mutex_unlock(&dev->dev_mutex);
 	return r;
 }
 
 int rtlsdr_get_offset_tuning(rtlsdr_dev_t *dev)
 {
+	int ot;
+
 	if (!dev)
 		return -1;
 
-	return (dev->offs_freq) ? 1 : 0;
+	pthread_mutex_lock(&dev->dev_mutex);
+	ot = (dev->offs_freq) ? 1 : 0;
+	pthread_mutex_unlock(&dev->dev_mutex);
+
+	return ot;
 }
 
 static rtlsdr_dongle_t *find_known_device(uint16_t vid, uint16_t pid)
@@ -1349,6 +1583,8 @@ int rtlsdr_get_device_usb_strings(uint32_t index, char *manufact,
 	uint32_t device_count = 0;
 	ssize_t cnt;
 
+	pthread_mutex_init_recursive(&devt.dev_mutex);
+
 	libusb_init(&ctx);
 
 	cnt = libusb_get_device_list(ctx, &list);
@@ -1378,6 +1614,8 @@ int rtlsdr_get_device_usb_strings(uint32_t index, char *manufact,
 	libusb_free_device_list(list, 1);
 
 	libusb_exit(ctx);
+
+	pthread_mutex_destroy(&devt.dev_mutex);
 
 	return r;
 }
@@ -1422,6 +1660,9 @@ int rtlsdr_open(rtlsdr_dev_t **out_dev, uint32_t index)
 
 	memset(dev, 0, sizeof(rtlsdr_dev_t));
 	memcpy(dev->fir, fir_default, sizeof(fir_default));
+
+	pthread_mutex_init_recursive(&dev->dev_mutex);
+	pthread_mutex_init(&dev->async_mutex, NULL);
 
 	libusb_init(&dev->ctx);
 
@@ -1591,6 +1832,9 @@ found:
 	return 0;
 err:
 	if (dev) {
+		pthread_mutex_destroy(&dev->dev_mutex);
+		pthread_mutex_destroy(&dev->async_mutex);
+
 		if (dev->ctx)
 			libusb_exit(dev->ctx);
 
@@ -1605,17 +1849,45 @@ int rtlsdr_close(rtlsdr_dev_t *dev)
 	if (!dev)
 		return -1;
 
-	if(!dev->dev_lost) {
-		/* block until all async operations have been completed (if any) */
-		rtlsdr_cancel_async(dev);
-		while (RTLSDR_INACTIVE != dev->async_status) {
-#ifdef _WIN32
-			Sleep(1);
-#else
-			usleep(1000);
-#endif
+	pthread_mutex_lock(&dev->async_mutex);
+	if (dev->async_status == RTLSDR_CLOSING) {
+		/* What are you doing???? */
+		pthread_mutex_unlock(&dev->async_mutex);
+		return -1;
+	}
+
+	if (dev->async_status != RTLSDR_INACTIVE) {
+		if (pthread_equal(dev->async_thread_id, pthread_self())) {
+			/* Eep. Can't close the device from the thread currently doing async work! */
+			pthread_mutex_unlock(&dev->async_mutex);
+			return -EINVAL;
 		}
 
+		/* block until all async operations have been completed */
+		if (dev->async_status == RTLSDR_RUNNING) {
+			dev->async_status = RTLSDR_CANCEL_REQUEST;
+			dev->async_wakeup = 1;
+		}
+
+		while (dev->async_status != RTLSDR_INACTIVE) {
+			/* todo: condition variable
+			 * hardly seems worth it for this one case, though
+			 */
+			pthread_mutex_unlock(&dev->async_mutex);
+#ifdef _WIN32
+			Sleep(10);
+#else
+			usleep(10000);
+#endif
+			pthread_mutex_lock(&dev->async_mutex);
+		}
+	}
+
+	dev->async_status = RTLSDR_CLOSING; /* prevent more calls to rtlsdr_read_async() */
+	pthread_mutex_unlock(&dev->async_mutex);
+
+	pthread_mutex_lock(&dev->dev_mutex);
+	if(!dev->dev_lost) {
 		rtlsdr_deinit_baseband(dev);
 	}
 
@@ -1634,6 +1906,9 @@ int rtlsdr_close(rtlsdr_dev_t *dev)
 
 	libusb_exit(dev->ctx);
 
+	pthread_mutex_unlock(&dev->dev_mutex);
+	pthread_mutex_destroy(&dev->async_mutex);
+	pthread_mutex_destroy(&dev->dev_mutex);
 	free(dev);
 
 	return 0;
@@ -1641,17 +1916,29 @@ int rtlsdr_close(rtlsdr_dev_t *dev)
 
 int rtlsdr_reset_buffer(rtlsdr_dev_t *dev)
 {
+	int r = 0;
+
 	if (!dev)
 		return -1;
 
-	rtlsdr_write_reg(dev, USBB, USB_EPA_CTL, 0x1002, 2);
-	rtlsdr_write_reg(dev, USBB, USB_EPA_CTL, 0x0000, 2);
+	pthread_mutex_lock(&dev->dev_mutex);
+	if (dev->dev_lost) {
+		r = -1;
+		goto out;
+	}
 
-	return 0;
+	r |= rtlsdr_write_reg(dev, USBB, USB_EPA_CTL, 0x1002, 2);
+	r |= rtlsdr_write_reg(dev, USBB, USB_EPA_CTL, 0x0000, 2);
+
+ out:
+	pthread_mutex_unlock(&dev->dev_mutex);
+	return r;
 }
 
 int rtlsdr_read_sync(rtlsdr_dev_t *dev, void *buf, int len, int *n_read)
 {
+	int r;
+
 	if (!dev)
 		return -1;
 
@@ -1662,6 +1949,8 @@ static void LIBUSB_CALL _libusb_callback(struct libusb_transfer *usb_xfer)
 {
 	struct xfer_ctx *ctx = (struct xfer_ctx *)usb_xfer->user_data;
 	rtlsdr_dev_t *dev = ctx->dev;
+
+	pthread_mutex_lock(&dev->async_mutex);
 
 	/* add this transfer to the list of unprocessed completed transfers;
 	 * the actual callback to user code is done from rtlsdr_read_async()
@@ -1691,16 +1980,17 @@ static void LIBUSB_CALL _libusb_callback(struct libusb_transfer *usb_xfer)
 		if (dev->xfer_errors >= dev->xfer_buf_num ||
 		    LIBUSB_TRANSFER_NO_DEVICE == usb_xfer->status) {
 #endif
-			if (!dev->dev_lost) {
-				dev->dev_lost = 1;
-				fprintf(stderr, "cb transfer status: %d, "
-					"canceling...\n", usb_xfer->status);
-				rtlsdr_cancel_async(dev);
-			}
+			ctx->status = XFER_COMPLETED_DEV_LOST;
+			if (dev->async_status == RTLSDR_RUNNING) {
+			        fprintf(stderr, "cb transfer status: %d, device lost!\n", usb_xfer->status);
+				dev->async_status = RTLSDR_CANCEL_REQUEST;
+		        }
 #ifndef _WIN32
 		}
 #endif
 	}
+
+	pthread_mutex_unlock(&dev->async_mutex);
 }
 
 int rtlsdr_wait_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx)
@@ -1777,8 +2067,26 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 	if (!dev)
 		return -1;
 
-	if (RTLSDR_INACTIVE != dev->async_status)
+	pthread_mutex_lock(&dev->dev_mutex);
+	if (dev->dev_lost) {
+		pthread_mutex_unlock(&dev->dev_mutex);
+		return -1;
+	}
+
+	pthread_mutex_lock(&dev->async_mutex);
+	if (RTLSDR_INACTIVE != dev->async_status) {
+		pthread_mutex_unlock(&dev->async_mutex);
+		pthread_mutex_unlock(&dev->dev_mutex);
 		return -2;
+	}
+
+	dev->async_status = RTLSDR_RUNNING;
+	dev->async_thread_id = pthread_self();
+	pthread_mutex_unlock(&dev->async_mutex);
+
+	/* now we know we are the only thread dealing with async state,
+	 * for now.
+	 */
 
 	if (buf_num > 0)
 		dev->xfer_buf_num = buf_num;
@@ -1790,10 +2098,10 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 	else
 		dev->xfer_buf_len = DEFAULT_BUF_LENGTH;
 
-	if (_rtlsdr_alloc_async_buffers(dev) < 0)
-		return -1;
-
-	dev->async_status = RTLSDR_RUNNING;
+	if (_rtlsdr_alloc_async_buffers(dev) < 0) {
+		pthread_mutex_unlock(&dev->dev_mutex);
+		return -ENOMEM;
+	}
 
 	for(i = 0; i < dev->xfer_buf_num; ++i) {
 		libusb_fill_bulk_transfer(dev->xfer[i].usb_xfer,
@@ -1811,17 +2119,25 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 			fprintf(stderr, "Failed to submit transfer %d: %s\n", i, libusb_strerror(r));
 			dev->xfer[i].status = XFER_COMPLETED_ERROR;
 			dev->async_status = RTLSDR_CANCEL_REQUEST;
-			if (r == LIBUSB_TRANSFER_NO_DEVICE)
+			if (r == LIBUSB_TRANSFER_NO_DEVICE) {
 				dev->dev_lost = 1;
+			}
 			break;
 		}
 	}
 
-	while (RTLSDR_INACTIVE != dev->async_status) {
+	pthread_mutex_unlock(&dev->dev_mutex);
+
+	pthread_mutex_lock(&dev->async_mutex);
+	while (dev->async_status != RTLSDR_INACTIVE) {
+		int dev_lost = 0;
+
 		if (dev->xfer_head == NULL && dev->async_status != RTLSDR_CANCEL_REQUEST) {
 			dev->async_wakeup = 0;
+			pthread_mutex_unlock(&dev->async_mutex);
 			r = libusb_handle_events_timeout_completed(dev->ctx, &tv,
 								   &dev->async_wakeup);
+			pthread_mutex_lock(&dev->async_mutex);
 			if (r < 0) {
 				/*fprintf(stderr, "handle_events returned: %d\n", r);*/
 				if (r == LIBUSB_ERROR_INTERRUPTED) /* stray signal */
@@ -1833,6 +2149,8 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 		/* Handle unprocessed completed transfers */
 		while (dev->xfer_head) {
 			struct xfer_ctx *head = dev->xfer_head;
+			int resubmit;
+
 			/*
 			 * We must be in a consistent state here before doing
 			 * the callback, as the callback might call into libusb
@@ -1842,15 +2160,17 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 			if (!dev->xfer_head)
 				dev->xfer_tail = NULL;
 
-			/* Don't bother passing data to the callback if we just
-			 * lost the device, the callback will just see errors if
-			 * it tries to do anything with the device.
-			 */
-			if (head->status == XFER_COMPLETED_OK && !dev->dev_lost) {
+			/* Notice device loss discovered by the callback */
+			if (head->status == XFER_COMPLETED_DEV_LOST)
+				dev_lost = 1;
+
+			if (head->status == XFER_COMPLETED_OK) {
+				pthread_mutex_unlock(&dev->async_mutex);
 				cb(head->buf, head->actual_length, ctx);
+				pthread_mutex_lock(&dev->async_mutex);
 			}
 
-			if (dev->async_status == RTLSDR_RUNNING) {
+			if (dev->async_status == RTLSDR_RUNNING && !dev_lost) {
 				head->status = XFER_SUBMITTED;
 				r = libusb_submit_transfer(head->usb_xfer);
 				if (r < 0) {
@@ -1858,7 +2178,7 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 					head->status = XFER_COMPLETED_ERROR;
 					dev->async_status = RTLSDR_CANCEL_REQUEST;
 					if (r == LIBUSB_TRANSFER_NO_DEVICE)
-						dev->dev_lost = 1;
+						dev_lost = 1;
 				}
 			}
 		}
@@ -1885,32 +2205,48 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 			}
 			dev->async_status = next_state;
 		}
+
+		/* update device dev_lost status */
+		if (dev_lost) {
+			pthread_mutex_unlock(&dev->async_mutex);
+			pthread_mutex_lock(&dev->dev_mutex);
+			dev->dev_lost = 1;
+			pthread_mutex_unlock(&dev->dev_mutex);
+			pthread_mutex_lock(&dev->async_mutex);
+		}
 	}
 
 	_rtlsdr_free_async_buffers(dev);
 	dev->async_status = RTLSDR_INACTIVE;
+	pthread_mutex_unlock(&dev->async_mutex);
 
 	return r;
 }
 
 int rtlsdr_cancel_async(rtlsdr_dev_t *dev)
 {
+	int r = 0;
+
 	if (!dev)
 		return -1;
 
+	pthread_mutex_lock(&dev->async_mutex);
+
 	/* already requested? */
 	if (RTLSDR_CANCEL_REQUEST == dev->async_status || RTLSDR_CANCELING == dev->async_status) {
-		return 0;
-	}
-
-	/* if streaming, try to cancel gracefully */
-	if (RTLSDR_RUNNING == dev->async_status) {
+		/* nothing */
+	} else if (RTLSDR_RUNNING == dev->async_status) {
+		/* if streaming, try to cancel gracefully */
 		dev->async_status = RTLSDR_CANCEL_REQUEST;
 		dev->async_wakeup = 1;
-		return 0;
+	} else {
+		r = -2;
 	}
 
-	return -2;
+	pthread_mutex_unlock(&dev->async_mutex);
+
+	return r;
+
 }
 
 uint32_t rtlsdr_get_tuner_clock(void *dev)

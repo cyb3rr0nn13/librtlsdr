@@ -48,7 +48,7 @@ ENDIF(MSVC)
 # Setup shared library variant
 ########################################################################
 add_library(rtlsdr_shared SHARED ${rtlsdr_srcs})
-target_link_libraries(rtlsdr_shared ${LIBUSB_LIBRARIES})
+target_link_libraries(rtlsdr_shared ${LIBUSB_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
 set_target_properties(rtlsdr_shared PROPERTIES DEFINE_SYMBOL "rtlsdr_EXPORTS")
 set_target_properties(rtlsdr_shared PROPERTIES OUTPUT_NAME rtlsdr)
 set_target_properties(rtlsdr_shared PROPERTIES SOVERSION ${MAJOR_VERSION})
