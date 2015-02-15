@@ -1583,6 +1583,7 @@ int rtlsdr_get_device_usb_strings(uint32_t index, char *manufact,
 	uint32_t device_count = 0;
 	ssize_t cnt;
 
+	devt.dev_lost = 0;
 	pthread_mutex_init_recursive(&devt.dev_mutex);
 
 	libusb_init(&ctx);
